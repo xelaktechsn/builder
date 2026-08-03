@@ -1,0 +1,373 @@
+name: Release (builder)
+
+# Builds the private mouhamed1296/jollof-stock desktop app on this account's
+# free public-repo runners and publishes to mouhamed1296/jollof-releases.
+# Exists because the source account's hosted runners are billing-locked.
+#
+# Secrets required on THIS repo:
+#   SOURCE_TOKEN       token with read access to mouhamed1296/jollof-stock
+#   RELEASES_PAT       token with write access to mouhamed1296/jollof-releases
+#   VITE_API_URL       prod API base URL
+#   VITE_TAURI_SECRET  desktop client header secret
+#   TAURI_PRIVATE_KEY  updater signing key (contents of jollof.key)
+#   TAURI_KEY_PASSWORD signing key password (empty if none)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source tag to build (e.g. v2.2.0)"
+        required: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: mouhamed1296/jollof-stock
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.rust_target }}
+
+      - name: Install JS dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Create .env.production
+        shell: bash
+        run: |
+          PATCH_MANIFEST_URL="https://github.com/mouhamed1296/jollof-releases/releases/latest/download/patches.json"
+          {
+            echo "VITE_API_URL=${{ secrets.VITE_API_URL }}"
+            echo "VITE_TAURI_SECRET=${{ secrets.VITE_TAURI_SECRET }}"
+            echo "VITE_ENV=production"
+            echo "VITE_APP_NAME=Jollof Stock"
+            echo "VITE_APP_VERSION=${TAG#v}"
+            echo "VITE_PATCH_MANIFEST_URL=${PATCH_MANIFEST_URL}"
+          } > .env.production
+        env:
+          TAG: ${{ inputs.tag }}
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        with:
+          args: ${{ matrix.args }}
+
+      - name: Collect bundle artifacts
+        shell: bash
+        run: |
+          mkdir -p bundle-out
+          find "src-tauri/target/${{ matrix.rust_target }}/release/bundle" \
+            -type f \( \
+              -name "*.msi" \
+              -o -name "*.msi.sig" \
+              -o -name "*.msi.zip" \
+              -o -name "*.msi.zip.sig" \
+              -o -name "*.nsis.zip" \
+              -o -name "*.nsis.zip.sig" \
+              -o -name "*-setup.exe" \
+              -o -name "*-setup.exe.sig" \
+            \) \
+            -exec cp {} bundle-out/ \; 2>/dev/null || true
+          echo "=== Collected artifacts ==="
+          ls -la bundle-out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.rust_target }}
+          path: bundle-out/
+          if-no-files-found: warn
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      # Source checkout only for docs/CHANGELOG.md release notes
+      - uses: actions/checkout@v4
+        with:
+          repository: mouhamed1296/jollof-stock
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Extract version
+        id: ver
+        run: echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+        env:
+          TAG: ${{ inputs.tag }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List collected artifacts
+        run: find artifacts -type f | sort
+
+      # GitHub Releases rewrites asset filenames on upload: spaces become
+      # dots. latest.json is generated from the LOCAL filename, so rename
+      # locally first so disk name == published asset name.
+      - name: Normalize artifact names (GitHub strips spaces)
+        run: |
+          while IFS= read -r -d '' f; do
+            dir=$(dirname "$f")
+            base=$(basename "$f")
+            normalized="${base// /.}"
+            if [ "$base" != "$normalized" ]; then
+              echo "Renaming: $base → $normalized"
+              mv "$f" "$dir/$normalized"
+            fi
+          done < <(find artifacts -type f -name "* *" -print0)
+
+      - name: Extract changelog notes
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          NOTES=""
+          if [ -f docs/CHANGELOG.md ]; then
+            NOTES=$(awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" docs/CHANGELOG.md)
+          fi
+          [ -z "${NOTES}" ] && NOTES="Release v${VERSION}"
+          echo "${NOTES}" > release_notes.txt
+          echo "=== Release notes ===" && cat release_notes.txt
+
+      - name: Generate latest.json
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TAG="${{ inputs.tag }}"
+          PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          BASE_URL="https://github.com/mouhamed1296/jollof-releases/releases/download/${TAG}"
+
+          read_sig() { [ -f "$1" ] && cat "$1" || echo ""; }
+
+          WIN_ZIP=$(find artifacts -name "*-setup.exe" ! -name "*.sig" -type f | head -1)
+          WIN_SIG=$(find artifacts -name "*-setup.exe.sig" -type f | head -1)
+          if [ -z "${WIN_ZIP}" ]; then
+            WIN_ZIP=$(find artifacts -name "*.msi" ! -name "*.sig" ! -name "*.zip*" -type f | head -1)
+            WIN_SIG=$(find artifacts -name "*.msi.sig" -type f | head -1)
+          fi
+          if [ -z "${WIN_ZIP}" ]; then
+            WIN_ZIP=$(find artifacts -name "*.nsis.zip" ! -name "*.sig" -type f | head -1)
+            WIN_SIG=$(find artifacts -name "*.nsis.zip.sig" -type f | head -1)
+          fi
+          if [ -z "${WIN_ZIP}" ]; then
+            WIN_ZIP=$(find artifacts -name "*.msi.zip" ! -name "*.sig" -type f | head -1)
+            WIN_SIG=$(find artifacts -name "*.msi.zip.sig" -type f | head -1)
+          fi
+          WIN_FILE=$(basename "${WIN_ZIP:-missing}")
+          WIN_SIGNATURE=$(read_sig "${WIN_SIG}")
+
+          if [ "${WIN_FILE}" = "missing" ] || [ -z "${WIN_SIGNATURE}" ]; then
+            echo "ERROR: Windows updater artifact or signature missing." >&2
+            exit 1
+          fi
+
+          jq -n \
+            --arg version        "$VERSION" \
+            --arg notes          "$(cat release_notes.txt)" \
+            --arg pub_date       "$PUB_DATE" \
+            --arg win_url        "${BASE_URL}/${WIN_FILE}" \
+            --arg win_sig        "${WIN_SIGNATURE}" \
+            '{
+              version:  $version,
+              notes:    $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "windows-x86_64": { url: $win_url, signature: $win_sig }
+              }
+            }' > latest.json
+
+          echo "=== latest.json ===" && cat latest.json
+
+      - name: Create release in jollof-releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          gh release create "${{ inputs.tag }}" \
+            --repo mouhamed1296/jollof-releases \
+            --title "Jollof Stock v${{ steps.ver.outputs.version }}" \
+            --notes-file release_notes.txt \
+            --draft=false \
+            --prerelease=false || echo "release may already exist — continuing"
+
+      - name: Upload latest.json
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          gh release upload "${{ inputs.tag }}" latest.json \
+            --repo mouhamed1296/jollof-releases \
+            --clobber
+
+      - name: Upload all platform artifacts
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          while IFS= read -r -d '' f; do
+            echo "Uploading: $(basename "$f")"
+            gh release upload "${{ inputs.tag }}" "$f" \
+              --repo mouhamed1296/jollof-releases \
+              --clobber
+          done < <(find artifacts -type f -print0)
+
+      - name: Install bsdiff
+        run: sudo apt-get update && sudo apt-get install -y bsdiff jq
+
+      - name: Resolve previous release tag
+        id: prev
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          CURRENT_TAG="${{ inputs.tag }}"
+          PREV_TAG=$(gh release list \
+              --repo mouhamed1296/jollof-releases \
+              --exclude-drafts \
+              --limit 20 \
+              --json tagName,isPrerelease \
+              --jq '[.[] | select(.isPrerelease == false) | .tagName] | map(select(. != "'"$CURRENT_TAG"'")) | .[0] // ""')
+          echo "prev_tag=${PREV_TAG}" >> $GITHUB_OUTPUT
+          if [ -n "$PREV_TAG" ]; then
+            echo "Previous tag: $PREV_TAG"
+          else
+            echo "No previous release found — patch generation will skip."
+          fi
+
+      - name: Download previous release archives
+        if: steps.prev.outputs.prev_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          mkdir -p previous-archives
+          gh release download "${{ steps.prev.outputs.prev_tag }}" \
+            --repo mouhamed1296/jollof-releases \
+            --dir previous-archives \
+            --pattern '*-setup.exe' \
+            --pattern '*.nsis.zip' \
+            --pattern '*.msi.zip' \
+            --clobber || true
+          echo "=== Previous archives ==="
+          ls -la previous-archives/ || true
+
+      - name: Generate patches + patches.json
+        if: steps.prev.outputs.prev_tag != ''
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TAG="${{ inputs.tag }}"
+          PREV_TAG="${{ steps.prev.outputs.prev_tag }}"
+          PREV_VERSION="${PREV_TAG#v}"
+          BASE_URL="https://github.com/mouhamed1296/jollof-releases/releases/download/${TAG}"
+
+          mkdir -p patches
+          PATCHES_JSON=$(mktemp)
+          echo '[]' > "$PATCHES_JSON"
+
+          emit_patch() {
+            local platform="$1"
+            local prev_archive="$2"
+            local new_archive="$3"
+
+            if [ ! -f "$prev_archive" ] || [ ! -f "$new_archive" ]; then
+              echo "Skipping $platform (missing $prev_archive or $new_archive)"
+              return
+            fi
+
+            local patch_name="${PREV_VERSION}-to-${VERSION}-${platform}.patch"
+            local patch_path="patches/$patch_name"
+
+            echo "==> bsdiff $platform: $(basename "$prev_archive") -> $(basename "$new_archive")"
+            bsdiff "$prev_archive" "$new_archive" "$patch_path"
+
+            local patch_sha=$(sha256sum "$patch_path"   | awk '{print $1}')
+            local patched_sha=$(sha256sum "$new_archive" | awk '{print $1}')
+            local patch_size=$(stat -c%s "$patch_path")
+            local new_size=$(stat -c%s "$new_archive")
+            local pct=$(awk -v p=$patch_size -v n=$new_size 'BEGIN{printf "%.1f", (p/n)*100}')
+            echo "    patch=${patch_size}B, full=${new_size}B (${pct}% of full)"
+
+            jq --arg from "$PREV_VERSION" \
+               --arg platform "$platform" \
+               --arg url "$BASE_URL/$patch_name" \
+               --arg sha "$patch_sha" \
+               --arg psha "$patched_sha" \
+               --argjson size "$patch_size" \
+               '. += [{
+                  from_version: $from,
+                  platform: $platform,
+                  url: $url,
+                  sha256: $sha,
+                  patched_sha256: $psha,
+                  size_bytes: $size
+                }]' "$PATCHES_JSON" > "$PATCHES_JSON.new"
+            mv "$PATCHES_JSON.new" "$PATCHES_JSON"
+          }
+
+          PREV_WIN=$(find previous-archives -name "*-setup.exe" ! -name "*.sig" -type f | head -1)
+          NEW_WIN=$(find artifacts          -name "*-setup.exe" ! -name "*.sig" -type f | head -1)
+          if [ -z "$PREV_WIN" ] || [ -z "$NEW_WIN" ]; then
+            PREV_WIN=$(find previous-archives -name "*.nsis.zip" -type f | head -1)
+            NEW_WIN=$(find artifacts          -name "*.nsis.zip" -type f | head -1)
+          fi
+          if [ -z "$PREV_WIN" ] || [ -z "$NEW_WIN" ]; then
+            PREV_WIN=$(find previous-archives -name "*.msi.zip" -type f | head -1)
+            NEW_WIN=$(find artifacts          -name "*.msi.zip" -type f | head -1)
+          fi
+          emit_patch "windows-x86_64" "$PREV_WIN" "$NEW_WIN"
+
+          jq --arg target "$VERSION" \
+             '{ target_version: $target, patches: . }' \
+             "$PATCHES_JSON" > patches/patches.json
+
+          echo "=== patches.json ==="
+          cat patches/patches.json
+
+      - name: Write empty patches.json when no previous release
+        if: steps.prev.outputs.prev_tag == ''
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          mkdir -p patches
+          jq -n --arg v "$VERSION" '{ target_version: $v, patches: [] }' > patches/patches.json
+          cat patches/patches.json
+
+      - name: Upload patches to release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          gh release upload "${{ inputs.tag }}" patches/patches.json \
+            --repo mouhamed1296/jollof-releases \
+            --clobber
+
+          for f in patches/*.patch; do
+            [ -f "$f" ] || continue
+            echo "Uploading: $(basename "$f")"
+            gh release upload "${{ inputs.tag }}" "$f" \
+              --repo mouhamed1296/jollof-releases \
+              --clobber
+          done
