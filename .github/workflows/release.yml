@@ -56,7 +56,10 @@ jobs:
           key: ${{ matrix.rust_target }}
 
       - name: Install JS dependencies
-        run: yarn install --frozen-lockfile
+        # npm ci against the source repo's package-lock.json — there is no
+        # yarn.lock, so yarn silently resolved fresh and let @tauri-apps/*
+        # npm plugins float past their Rust crates (fatal mismatch check).
+        run: npm ci
 
       - name: Create .env.production
         shell: bash
