@@ -64,6 +64,12 @@ jobs:
       - name: Create .env.production
         shell: bash
         run: |
+          # Refuse to ship a build pointing anywhere but the real API — a
+          # malformed secret once produced binaries falling back to localhost.
+          case "${{ secrets.VITE_API_URL }}" in
+            https://api.jollofstock.sn*) : ;;
+            *) echo "FATAL: VITE_API_URL secret is missing or malformed"; exit 1 ;;
+          esac
           PATCH_MANIFEST_URL="https://github.com/mouhamed1296/jollof-releases/releases/latest/download/patches.json"
           {
             echo "VITE_API_URL=${{ secrets.VITE_API_URL }}"
