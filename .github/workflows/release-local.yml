@@ -1,0 +1,252 @@
+name: Release Local (builder)
+
+# Builds "Jollof Stock Local" (the fully offline edition: NestJS API +
+# embedded PostgreSQL shipped inside the installer) and publishes it to
+# mouhamed1296/jollof-local-releases. Lives in xelaktechsn/builder because
+# the source account's hosted runners are billing-locked; this copy in
+# jollof-stock is the reference, keep both identical.
+#
+# Secrets required on the builder repo:
+#   SOURCE_TOKEN       read access to mouhamed1296/jollof-stock and
+#                      mouhamed1296/jollof-stock-backend
+#   RELEASES_PAT       write access to mouhamed1296/jollof-local-releases
+#   TAURI_PRIVATE_KEY  updater signing key (same key as the cloud edition)
+#   TAURI_KEY_PASSWORD signing key password (empty if none)
+# Never set VITE_API_URL / VITE_TAURI_SECRET here: the local edition gets
+# its API address and secret at runtime from the Rust shell.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag in jollof-local-releases (vX.Y.Z, or vX.Y.Z-local.N for a test build)"
+        required: true
+      ref:
+        description: "jollof-stock ref to build (branch or tag); empty = the tag"
+        required: false
+        default: ""
+      backend_ref:
+        description: "jollof-stock-backend ref (branch or tag)"
+        required: true
+        default: main
+      prerelease:
+        description: "Mark the GitHub release as a pre-release"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  NODE_OPTIONS: --max-old-space-size=4096
+  RUST_TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Resolve source ref
+        id: src
+        shell: bash
+        run: echo "ref=${REF:-$TAG}" >> "$GITHUB_OUTPUT"
+        env:
+          REF: ${{ inputs.ref }}
+          TAG: ${{ inputs.tag }}
+
+      - name: Checkout jollof-stock
+        uses: actions/checkout@v4
+        with:
+          repository: mouhamed1296/jollof-stock
+          ref: ${{ steps.src.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: app
+
+      - name: Checkout jollof-stock-backend
+        uses: actions/checkout@v4
+        with:
+          repository: mouhamed1296/jollof-stock-backend
+          ref: ${{ inputs.backend_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: backend
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          key: local-${{ env.RUST_TARGET }}
+
+      - name: Git credentials for private dependencies
+        # isa-project is public today; keeps working if it goes private.
+        shell: bash
+        run: git config --global url."https://x-access-token:${{ secrets.SOURCE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Guard the edition
+        shell: bash
+        working-directory: app
+        run: |
+          grep -q '^VITE_EDITION=local' .env.local-edition || { echo "FATAL: .env.local-edition must set VITE_EDITION=local"; exit 1; }
+          grep -q '"identifier": "com.jollofstock.local"' src-tauri/tauri.local.conf.json || { echo "FATAL: local overlay identifier missing"; exit 1; }
+          [ -z "${VITE_API_URL:-}" ] || { echo "FATAL: VITE_API_URL must not be set for the local edition"; exit 1; }
+
+      - name: Build the API sidecar tree (dist + production node_modules)
+        # Runs on the Windows runner on purpose: bcrypt's native addon is
+        # fetched for the host at npm ci.
+        shell: bash
+        working-directory: app
+        run: scripts/local/build-server.sh ../backend
+
+      - name: Fetch the Node runtime sidecar
+        shell: bash
+        working-directory: app
+        run: scripts/local/fetch-node.sh ${{ env.RUST_TARGET }}
+
+      - name: Install JS dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Version for the UI
+        shell: bash
+        working-directory: app
+        run: |
+          {
+            echo "VITE_ENV=production"
+            echo "VITE_APP_VERSION=${TAG#v}"
+          } > .env.local-edition.local
+        env:
+          TAG: ${{ inputs.tag }}
+
+      - name: Build + bundle (local overlay, embedded PostgreSQL)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          POSTGRESQL_VERSION: "=16.10.0"
+          # postgresql_embedded fetches the PostgreSQL archive from GitHub
+          # at build time; a token avoids the anonymous rate limit.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: app
+          args: --config src-tauri/tauri.local.conf.json --target ${{ env.RUST_TARGET }} --features local-server
+
+      - name: Collect bundle artifacts
+        shell: bash
+        run: |
+          mkdir -p bundle-out
+          find "app/src-tauri/target/${RUST_TARGET}/release/bundle" \
+            -type f \( \
+              -name "*.msi" -o -name "*.msi.sig" \
+              -o -name "*-setup.exe" -o -name "*-setup.exe.sig" \
+              -o -name "*.nsis.zip" -o -name "*.nsis.zip.sig" \
+            \) -exec cp {} bundle-out/ \;
+          echo "=== Collected artifacts ==="
+          ls -la bundle-out/
+          # Refuse to publish anything that is not the Local product.
+          ls bundle-out | grep -qi "local" || { echo "FATAL: no 'Jollof Stock Local' artifact found; was the overlay applied?"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: local-bundle-${{ env.RUST_TARGET }}
+          path: bundle-out/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve source ref
+        id: src
+        run: echo "ref=${REF:-$TAG}" >> "$GITHUB_OUTPUT"
+        env:
+          REF: ${{ inputs.ref }}
+          TAG: ${{ inputs.tag }}
+
+      # Source checkout only for docs/CHANGELOG.md release notes.
+      - uses: actions/checkout@v4
+        with:
+          repository: mouhamed1296/jollof-stock
+          ref: ${{ steps.src.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Extract version
+        id: ver
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ inputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Normalize artifact names (GitHub turns spaces into dots)
+        run: |
+          while IFS= read -r -d '' f; do
+            dir=$(dirname "$f"); base=$(basename "$f"); normalized="${base// /.}"
+            [ "$base" != "$normalized" ] && mv "$f" "$dir/$normalized"
+          done < <(find artifacts -type f -name "* *" -print0)
+          find artifacts -type f | sort
+
+      - name: Release notes
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          BASE="${VERSION%%-local.*}"
+          NOTES=""
+          if [ -f docs/CHANGELOG.md ]; then
+            NOTES=$(awk "/^## \[${BASE}\]/{found=1; next} found && /^## \[/{exit} found{print}" docs/CHANGELOG.md)
+          fi
+          {
+            echo "Jollof Stock Local ${VERSION} : édition hors ligne (serveur et base de données sur le PC de la boutique, licence par code)."
+            echo
+            echo "${NOTES:-Voir docs/CHANGELOG.md.}"
+          } > release_notes.txt
+          cat release_notes.txt
+
+      - name: Generate latest.json
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TAG="${{ inputs.tag }}"
+          BASE_URL="https://github.com/mouhamed1296/jollof-local-releases/releases/download/${TAG}"
+          WIN=$(find artifacts -name "*-setup.exe" ! -name "*.sig" -type f | head -1)
+          SIG=$(find artifacts -name "*-setup.exe.sig" -type f | head -1)
+          if [ -z "$WIN" ]; then
+            WIN=$(find artifacts -name "*.nsis.zip" ! -name "*.sig" -type f | head -1)
+            SIG=$(find artifacts -name "*.nsis.zip.sig" -type f | head -1)
+          fi
+          [ -n "$WIN" ] && [ -n "$SIG" ] || { echo "ERROR: Windows updater artifact or signature missing" >&2; exit 1; }
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$(cat release_notes.txt)" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg win_url "${BASE_URL}/$(basename "$WIN")" \
+            --arg win_sig "$(cat "$SIG")" \
+            '{version: $version, notes: $notes, pub_date: $pub_date,
+              platforms: {"windows-x86_64": {url: $win_url, signature: $win_sig}}}' > latest.json
+          cat latest.json
+
+      - name: Create the release in jollof-local-releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          gh release create "${{ inputs.tag }}" \
+            --repo mouhamed1296/jollof-local-releases \
+            --title "Jollof Stock Local v${{ steps.ver.outputs.version }}" \
+            --notes-file release_notes.txt \
+            --prerelease=${{ inputs.prerelease }} \
+            || echo "release already exists, uploading into it"
+
+      - name: Upload artifacts + latest.json
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          gh release upload "${{ inputs.tag }}" latest.json --repo mouhamed1296/jollof-local-releases --clobber
+          while IFS= read -r -d '' f; do
+            echo "Uploading: $(basename "$f")"
+            gh release upload "${{ inputs.tag }}" "$f" --repo mouhamed1296/jollof-local-releases --clobber
+          done < <(find artifacts -type f -print0)
