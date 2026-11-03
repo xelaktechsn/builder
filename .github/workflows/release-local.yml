@@ -234,12 +234,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_PAT }}
         run: |
-          gh release create "${{ inputs.tag }}" \
-            --repo mouhamed1296/jollof-local-releases \
-            --title "Jollof Stock Local v${{ steps.ver.outputs.version }}" \
-            --notes-file release_notes.txt \
-            --prerelease=${{ inputs.prerelease }} \
-            || echo "release already exists, uploading into it"
+          if gh release view "${{ inputs.tag }}" --repo mouhamed1296/jollof-local-releases >/dev/null 2>&1; then
+            echo "release already exists, uploading into it"
+          else
+            # Needs at least one commit in the releases repo (a tag must point somewhere).
+            gh release create "${{ inputs.tag }}" \
+              --repo mouhamed1296/jollof-local-releases \
+              --title "Jollof Stock Local v${{ steps.ver.outputs.version }}" \
+              --notes-file release_notes.txt \
+              --prerelease=${{ inputs.prerelease }}
+          fi
 
       - name: Upload artifacts + latest.json
         env:
